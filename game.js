@@ -41,9 +41,12 @@ const keymap = [
     jump: 'KeyW',
     left: 'KeyA',
     right: 'KeyD',
-    weak: 'KeyU',
-    medium: 'KeyI',
-    strong: 'KeyO',
+    weakPunch: 'KeyU',
+    mediumPunch: 'KeyI',
+    strongPunch: 'KeyO',
+    weakKick: 'KeyJ',
+    mediumKick: 'KeyK',
+    strongKick: 'KeyL',
     guard: 'KeyT',
     throw: 'KeyR',
   },
@@ -51,9 +54,12 @@ const keymap = [
     jump: 'ArrowUp',
     left: 'ArrowLeft',
     right: 'ArrowRight',
-    weak: 'Digit1',
-    medium: 'Digit2',
-    strong: 'Digit3',
+    weakPunch: 'Digit1',
+    mediumPunch: 'Digit2',
+    strongPunch: 'Digit3',
+    weakKick: 'Digit4',
+    mediumKick: 'Digit5',
+    strongKick: 'Digit6',
     guard: 'Digit0',
     throw: 'Enter',
   },
@@ -133,9 +139,12 @@ function inputFor(player) {
     left: keys.has(keySet.left),
     right: keys.has(keySet.right),
     guard: keys.has(keySet.guard),
-    weak: keys.has(keySet.weak),
-    medium: keys.has(keySet.medium),
-    strong: keys.has(keySet.strong),
+    weakPunch: keys.has(keySet.weakPunch),
+    mediumPunch: keys.has(keySet.mediumPunch),
+    strongPunch: keys.has(keySet.strongPunch),
+    weakKick: keys.has(keySet.weakKick),
+    mediumKick: keys.has(keySet.mediumKick),
+    strongKick: keys.has(keySet.strongKick),
     throw: keys.has(keySet.throw),
   };
 }
@@ -144,7 +153,7 @@ function attackFor(playerIndex, kind) {
   if (fighter.attack > 0 || fighter.stun > 0 || gameOver) {
     return;
   }
-  const attackDurations = { 1: 17, 2: 20, 3: 23, 4: 25 };
+  const attackDurations = { 1: 17, 2: 20, 3: 23, 4: 18, 5: 21, 6: 24, 7: 25 };
   fighter.attack = attackDurations[kind];
   fighter.attackKind = kind;
   fighter.attackId += 1;
@@ -209,10 +218,13 @@ function tick(deltaTime) {
     fighter.facing = opponent.x >= fighter.x ? 1 : -1;
     fighter.guard = Boolean(input.guard);
     const attacks = [
-      ['weak', 1],
-      ['medium', 2],
-      ['strong', 3],
-      ['throw', 4],
+      ['weakPunch', 1],
+      ['mediumPunch', 2],
+      ['strongPunch', 3],
+      ['weakKick', 4],
+      ['mediumKick', 5],
+      ['strongKick', 6],
+      ['throw', 7],
     ];
     for (const [button, kind] of attacks) {
       if (input[button] && !prior[index][button]) {
@@ -221,13 +233,16 @@ function tick(deltaTime) {
     }
     if (fighter.attack > 0) {
       fighter.attack = Math.max(0, fighter.attack - frameScale);
-      const active = fighter.attack > 4 && fighter.attack < (fighter.attackKind === 4 ? 18 : 13);
+      const active = fighter.attack > 4 && fighter.attack < (fighter.attackKind === 7 ? 18 : 13);
       const horizontalDistance = opponent.x - fighter.x;
       const verticalDistance = Math.abs(opponent.y - fighter.y);
       const attackReach =
-        fighter.attackKind === 4 ? 65 :
+        fighter.attackKind === 7 ? 65 :
         fighter.attackKind === 1 ? 78 :
-        fighter.attackKind === 2 ? 95 : 115;
+        fighter.attackKind === 2 ? 95 :
+        fighter.attackKind === 3 ? 115 :
+        fighter.attackKind === 4 ? 88 :
+        fighter.attackKind === 5 ? 105 : 125;
       const canHit =
         active &&
         Math.sign(horizontalDistance) === fighter.facing &&
@@ -239,11 +254,14 @@ function tick(deltaTime) {
         const isGuarded =
           opponent.guard &&
           opponent.facing === -fighter.facing &&
-          fighter.attackKind !== 4;
+          fighter.attackKind !== 7;
         const damage =
           fighter.attackKind === 1 ? 5 :
           fighter.attackKind === 2 ? 9 :
-          fighter.attackKind === 3 ? 14 : 12;
+          fighter.attackKind === 3 ? 14 :
+          fighter.attackKind === 4 ? 6 :
+          fighter.attackKind === 5 ? 10 :
+          fighter.attackKind === 6 ? 15 : 12;
         const appliedDamage = isGuarded ? Math.max(1, Math.floor(damage * 0.18)) : damage;
         opponent.hp = Math.max(0, opponent.hp - appliedDamage);
         if (isGuarded) {
@@ -252,11 +270,11 @@ function tick(deltaTime) {
           playHitSound(fighter.attackKind, true);
         } else {
           screenShake = Math.max(screenShake, 8);
-          opponent.stun = fighter.attackKind === 4 ? 15 : 8;
-          if (fighter.attackKind === 4) {
+          opponent.stun = fighter.attackKind === 7 ? 15 : 8;
+          if (fighter.attackKind === 7) {
             opponent.x = Math.max(60, Math.min(900, opponent.x + fighter.facing * 25));
           }
-          const effectColor = fighter.attackKind === 4 ? '#63d6d2' : '#ff765f';
+          const effectColor = fighter.attackKind === 7 ? '#63d6d2' : '#ff765f';
           spawnHitEffect(opponent.x, opponent.y - 10, effectColor);
           playHitSound(fighter.attackKind, false);
         }
@@ -373,12 +391,20 @@ function drawFighter(fighter, index) {
     ctx.stroke();
   }
   if (attack > 0) {
-    const attackReach =
-      attackKind === 1 ? 45 :
-      attackKind === 2 ? 60 :
-      attackKind === 3 ? 76 : 43;
-    ctx.fillStyle = attackKind === 4 ? '#63d6d2aa' : `${primaryColor}aa`;
-    ctx.fillRect(x + facing * 18, y - 17, attackReach, 12);
+    if (attackKind >= 4 && attackKind <= 6) {
+      const kickReach = attackKind === 4 ? 45 : attackKind === 5 ? 60 : 76;
+      ctx.fillStyle = darkColor;
+      ctx.fillRect(x + facing * 8, y + 5, facing * (kickReach - 8), 9);
+      ctx.fillStyle = primaryColor;
+      ctx.fillRect(x + facing * (kickReach - 3), y + 4, facing * 12, 11);
+    } else {
+      const attackReach =
+        attackKind === 1 ? 45 :
+        attackKind === 2 ? 60 :
+        attackKind === 3 ? 76 : 43;
+      ctx.fillStyle = attackKind === 7 ? '#63d6d2aa' : `${primaryColor}aa`;
+      ctx.fillRect(x + facing * 18, y - 17, facing * attackReach, 12);
+    }
   }
 }
 // PeerJSで接続した相手へゲームデータを送る
@@ -401,7 +427,7 @@ function setConnected() {
   const playerLabel = role === 'host' ? 'あなたはホスト' : 'あなたは参加者';
   setConnectionStatus(`P2P接続中 · ${playerLabel}`, true);
   document.getElementById('playNote').textContent =
-    'オンライン共通: A/D 移動 · W ジャンプ · U/I/O 攻撃 · T ガード · R 投げ';
+    'オンライン共通: A/D 移動 · W ジャンプ · U/I/O パンチ · J/K/L キック · T ガード · R 投げ';
 }
 // DataConnectionを受け取り、既存のゲーム同期メッセージを処理する
 function setupChannel(connection) {
@@ -596,7 +622,7 @@ resetButton.addEventListener('click', () => {
   document.getElementById('copyRoomBtn').textContent = 'コードをコピー';
   setConnectionStatus('ローカル練習モード');
   document.getElementById('playNote').textContent =
-    'ローカル練習 · 1P: A/D 移動 + W ジャンプ / 斜めジャンプ + U/I/O 攻撃 · 2P: ←/→ 移動 + ↑ ジャンプ / 斜めジャンプ';
+    'ローカル練習 · 1P: A/D 移動 + W ジャンプ / 斜めジャンプ + U/I/O パンチ・J/K/L キック · 2P: ←/→ 移動 + ↑ ジャンプ / 斜めジャンプ';
   updateNetwork();
 });
 // RTTを画面とグラフに表示する
