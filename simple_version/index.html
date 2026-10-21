@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DUEL / Simple Fighter</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="game.js" defer></script>
+  </head>
+  <body>
+    <main class="game-shell">
+      <header class="page-heading">
+        <p class="eyebrow">LOCAL 2 PLAYER</p>
+        <h1>DUEL <span>/ SIMPLE FIGHTER</span></h1>
+        <p class="description">2人で遊べるシンプルな格闘ゲーム</p>
+      </header>
+
+      <section class="arena" aria-label="対戦画面">
+        <div class="hud">
+          <div class="player-status">
+            <strong>PLAYER 1</strong>
+            <div class="health-track"><div class="health" id="hp1"></div></div>
+          </div>
+          <div class="timer" id="timer">99</div>
+          <div class="player-status player-status-right">
+            <strong>PLAYER 2</strong>
+            <div class="health-track"><div class="health health-p2" id="hp2"></div></div>
+          </div>
+        </div>
+        <canvas id="game" width="960" height="528" aria-label="格闘ゲーム"></canvas>
+        <div class="result" id="result" aria-live="polite"></div>
+      </section>
+
+      <section class="controls">
+        <div>
+          <h2>PLAYER 1</h2>
+          <p><kbd>A</kbd> / <kbd>D</kbd> 移動　<kbd>W</kbd> ジャンプ</p>
+          <p><kbd>U</kbd><kbd>I</kbd><kbd>O</kbd> パンチ　<kbd>J</kbd><kbd>K</kbd><kbd>L</kbd> キック</p>
+          <p><kbd>T</kbd> ガード　<kbd>R</kbd> 投げ</p>
+        </div>
+        <div>
+          <h2>PLAYER 2</h2>
+          <p><kbd>←</kbd> / <kbd>→</kbd> 移動　<kbd>↑</kbd> ジャンプ</p>
+          <p><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> パンチ　<kbd>4</kbd><kbd>5</kbd><kbd>6</kbd> キック</p>
+          <p><kbd>0</kbd> ガード　<kbd>Enter</kbd> 投げ</p>
+        </div>
+      </section>
+      <button class="restart" id="restart" type="button">ラウンドをリスタート</button>
+    </main>
+  </body>
+</html>
