@@ -14,6 +14,9 @@ let remoteInput = [{}, {}];
 let lastInputSent = 0;
 let lastStateSent = 0;
 let pingAt = 0;
+const snapshotBuffer = [];
+const snapshotDelay = 50;
+const maxSnapshots = 30;
 
 const keymap = [
   {
@@ -88,6 +91,7 @@ function resetRound() {
     createFighter(250, 1, '#d4fa58', '#788f31'),
     createFighter(710, -1, '#ff765f', '#a5423a'),
   ];
+  snapshotBuffer.length = 0;
   previousInput = [{}, {}];
   remoteInput = [{}, {}];
   remaining = 99;
@@ -320,6 +324,58 @@ function updateHud() {
   timerDisplay.textContent = String(Math.ceil(remaining)).padStart(2, '0');
 }
 
+function addSnapshot(snapshot) {
+  const receivedAt = performance.now();
+  const snapshotFighters = snapshot.fighters.map((fighter) => ({ ...fighter }));
+  snapshotBuffer.push({ receivedAt, fighters: snapshotFighters });
+  if (snapshotBuffer.length > maxSnapshots) {
+    snapshotBuffer.shift();
+  }
+  fighters = snapshotFighters;
+  remaining = snapshot.remaining;
+  gameOver = snapshot.gameOver;
+}
+
+function getRenderedFighters(now) {
+  if (role !== 'guest' || snapshotBuffer.length === 0) {
+    return fighters;
+  }
+
+  const targetTime = now - snapshotDelay;
+  let before = snapshotBuffer[0];
+  let after = null;
+  for (const snapshot of snapshotBuffer) {
+    if (snapshot.receivedAt <= targetTime) {
+      before = snapshot;
+    }
+    if (snapshot.receivedAt >= targetTime) {
+      after = snapshot;
+      break;
+    }
+  }
+
+  while (snapshotBuffer.length > 2 && snapshotBuffer[1].receivedAt <= targetTime) {
+    snapshotBuffer.shift();
+  }
+
+  if (!after || after === before || after.receivedAt <= before.receivedAt) {
+    return before.fighters;
+  }
+
+  const progress = Math.max(
+    0,
+    Math.min(1, (targetTime - before.receivedAt) / (after.receivedAt - before.receivedAt)),
+  );
+  return before.fighters.map((fighter, index) => {
+    const nextFighter = after.fighters[index];
+    return {
+      ...fighter,
+      x: fighter.x + (nextFighter.x - fighter.x) * progress,
+      y: fighter.y + (nextFighter.y - fighter.y) * progress,
+    };
+  });
+}
+
 function updateFrameMeter() {
   const frameMeter = document.getElementById('frameMeter');
   frameMeter.hidden = role !== 'local';
@@ -384,12 +440,12 @@ function updateFrameMeter() {
   });
 }
 
-function draw() {
+function draw(now) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.save();
   ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake);
   drawArena();
-  fighters.forEach(drawFighter);
+  getRenderedFighters(now).forEach(drawFighter);
   ctx.restore();
   screenShake = Math.max(0, screenShake - 0.7);
   drawGameOver();
@@ -415,7 +471,7 @@ function loop(now) {
       pingAt = now;
     }
   }
-  draw();
+  draw(now);
   requestAnimationFrame(loop);
 }
 
@@ -497,6 +553,7 @@ function setupChannel(connection) {
   connection.on('close', () => {
     if (channel === connection) {
       channel = null;
+      snapshotBuffer.length = 0;
       setConnectionStatus('通信が切断されました');
     }
   });
@@ -515,9 +572,10 @@ function setupChannel(connection) {
       if (!Array.isArray(message.fighters) || message.fighters.length !== 2) {
         return;
       }
-      fighters = message.fighters;
-      remaining = message.remaining;
-      gameOver = message.gameOver;
+      if (message.rematch) {
+        snapshotBuffer.length = 0;
+      }
+      addSnapshot(message);
       if (message.rematch) {
         setConnectionStatus('オンライン接続中（参加者）');
       }
