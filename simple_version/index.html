@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DUEL / Simple Fighter</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
     <script src="game.js" defer></script>
   </head>
   <body>
@@ -35,17 +36,85 @@
         <div>
           <h2>PLAYER 1</h2>
           <p><kbd>A</kbd> / <kbd>D</kbd> 移動　<kbd>W</kbd> ジャンプ</p>
-          <p><kbd>U</kbd><kbd>I</kbd><kbd>O</kbd> パンチ　<kbd>J</kbd><kbd>K</kbd><kbd>L</kbd> キック</p>
-          <p><kbd>T</kbd> ガード　<kbd>R</kbd> 投げ</p>
+          <p><kbd>U</kbd><kbd>I</kbd><kbd>O</kbd> 弱・中・強　<kbd>R</kbd> 必殺技</p>
+          <p><kbd>S</kbd> + <kbd>A</kbd>/<kbd>D</kbd> ガード（相手と逆方向）</p>
         </div>
         <div>
           <h2>PLAYER 2</h2>
           <p><kbd>←</kbd> / <kbd>→</kbd> 移動　<kbd>↑</kbd> ジャンプ</p>
-          <p><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> パンチ　<kbd>4</kbd><kbd>5</kbd><kbd>6</kbd> キック</p>
-          <p><kbd>0</kbd> ガード　<kbd>Enter</kbd> 投げ</p>
+          <p><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 弱・中・強　<kbd>4</kbd> 必殺技</p>
+          <p><kbd>↓</kbd> + <kbd>←</kbd>/<kbd>→</kbd> ガード（相手と逆方向）</p>
         </div>
       </section>
+
+      <section id="frameMeter" class="frame-meter" aria-label="ローカルフレームメータ">
+        <div class="frame-meter-heading">
+          <div>
+            <h2>FRAME METER</h2>
+            <p>ローカル専用 · 攻撃の発生・持続・硬直を表示</p>
+          </div>
+          <div class="frame-legend" aria-label="色の説明">
+            <span><i class="startup-color"></i>発生</span>
+            <span><i class="active-color"></i>持続</span>
+            <span><i class="recovery-color"></i>硬直</span>
+          </div>
+        </div>
+        <div class="frame-meter-row">
+          <div class="frame-meter-label">
+            <strong>PLAYER 1</strong>
+            <span id="frameStatus1" aria-live="polite">待機</span>
+          </div>
+          <div class="frame-track" role="img" aria-label="プレイヤー1の攻撃フレーム">
+            <span class="frame-segment startup-segment" id="frameStartup1"></span>
+            <span class="frame-segment active-segment" id="frameActive1"></span>
+            <span class="frame-segment recovery-segment" id="frameRecovery1"></span>
+            <span class="frame-marker" id="frameMarker1"></span>
+          </div>
+        </div>
+        <div class="frame-meter-row">
+          <div class="frame-meter-label">
+            <strong>PLAYER 2</strong>
+            <span id="frameStatus2" aria-live="polite">待機</span>
+          </div>
+          <div class="frame-track" role="img" aria-label="プレイヤー2の攻撃フレーム">
+            <span class="frame-segment startup-segment" id="frameStartup2"></span>
+            <span class="frame-segment active-segment" id="frameActive2"></span>
+            <span class="frame-segment recovery-segment" id="frameRecovery2"></span>
+            <span class="frame-marker" id="frameMarker2"></span>
+          </div>
+        </div>
+      </section>
+
       <button class="restart" id="restart" type="button">ラウンドをリスタート</button>
+
+      <section class="network-panel" aria-label="オンライン対戦">
+        <h2>オンライン対戦</h2>
+        <p id="connectionStatus" role="status">ローカル2人プレイ</p>
+        <div class="network-actions">
+          <button id="createRoomBtn" type="button">部屋を作成</button>
+          <input
+            id="roomCode"
+            aria-label="共有する部屋コード"
+            placeholder="部屋コードがここに表示されます"
+            readonly
+          >
+          <button id="copyRoomBtn" type="button" disabled>コードをコピー</button>
+          <input
+            id="joinCodeInput"
+            aria-label="参加する部屋コード"
+            placeholder="相手の部屋コード"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          >
+          <button id="joinRoomBtn" type="button">参加</button>
+          <button id="resetConnectionBtn" type="button">切断してローカルに戻る</button>
+        </div>
+        <p class="network-note">
+          ホストが部屋を作成し、部屋コードを共有してください。参加者はコードを入力して参加します。
+          接続にはPeerJSの公開サービスを利用します。
+        </p>
+      </section>
     </main>
   </body>
 </html>
