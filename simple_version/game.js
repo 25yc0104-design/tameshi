@@ -406,7 +406,7 @@ function loop(now) {
       send({ type: 'input', input: inputFor(1) });
       lastInputSent = now;
     }
-    if (role === 'host' && now - lastStateSent > 33) {
+    if (role === 'host' && now - lastStateSent >= 1000 / 60) {
       send({ type: 'state', fighters, remaining, gameOver });
       lastStateSent = now;
     }
