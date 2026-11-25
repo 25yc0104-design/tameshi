@@ -1,5 +1,7 @@
 'use strict';
 
+import { RollbackNetwork } from './network.js';
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 const keys = new Set();
@@ -7,25 +9,6 @@ const hpBars = [document.getElementById('hp1'), document.getElementById('hp2')];
 const timerDisplay = document.getElementById('timer');
 const resultDisplay = document.getElementById('result');
 const connectionStatus = document.getElementById('connectionStatus');
-let peer = null;
-let channel = null;
-let role = 'local';
-let pingAt = 0;
-let handshakeTimeout = null;
-const FIXED_STEP_MS = 1000 / 60;
-const MAX_ROLLBACK_FRAMES = 180;
-const MAX_STEPS_PER_RENDER = 5;
-const PROTOCOL_VERSION = 2;
-let simulationAccumulator = 0;
-let simulationFrame = 0;
-let onlineStarted = false;
-let syncPaused = false;
-let syncEpoch = 0;
-let pendingResyncToken = null;
-let resyncTokenSequence = 0;
-const frameInputs = new Map();
-const receivedRemoteInputs = new Map();
-const frameStates = new Map();
 
 const keymap = [
   {
@@ -72,6 +55,7 @@ let remaining;
 let gameOver;
 let lastFrame = performance.now();
 let screenShake = 0;
+let network;
 
 function createFighter(x, facing, color, darkColor) {
   return {
@@ -104,12 +88,6 @@ function resetRound() {
   remaining = 99;
   gameOver = false;
   screenShake = 0;
-  simulationFrame = 0;
-  simulationAccumulator = 0;
-  onlineStarted = role === 'local';
-  syncPaused = false;
-  pendingResyncToken = null;
-  clearRollbackHistory();
   resultDisplay.textContent = '';
   updateHud();
 }
@@ -332,20 +310,6 @@ function updateHud() {
   timerDisplay.textContent = String(Math.ceil(remaining)).padStart(2, '0');
 }
 
-const inputActions = ['left', 'right', 'jump', 'down', 'weak', 'medium', 'strong', 'special'];
-
-function normalizeInput(input) {
-  const normalized = {};
-  for (const action of inputActions) {
-    normalized[action] = Boolean(input?.[action]);
-  }
-  return normalized;
-}
-
-function neutralInput() {
-  return normalizeInput({});
-}
-
 function cloneState() {
   return {
     fighters: fighters.map((fighter) => ({ ...fighter })),
@@ -393,249 +357,9 @@ function isValidState(state) {
   );
 }
 
-function clearRollbackHistory() {
-  frameInputs.clear();
-  receivedRemoteInputs.clear();
-  frameStates.clear();
-  frameStates.set(simulationFrame, cloneState());
-}
-
-function pruneRollbackHistory() {
-  const oldestFrame = simulationFrame - MAX_ROLLBACK_FRAMES;
-  for (const frame of frameInputs.keys()) {
-    if (frame < oldestFrame - 1) {
-      frameInputs.delete(frame);
-    }
-  }
-  for (const frame of receivedRemoteInputs.keys()) {
-    if (frame < oldestFrame) {
-      receivedRemoteInputs.delete(frame);
-    }
-  }
-  for (const frame of frameStates.keys()) {
-    if (frame < oldestFrame) {
-      frameStates.delete(frame);
-    }
-  }
-}
-
-function remoteInputForFrame(frame, remotePlayer) {
-  const received = receivedRemoteInputs.get(frame);
-  if (received) {
-    return received;
-  }
-  return frameInputs.get(frame - 1)?.[remotePlayer] || neutralInput();
-}
-
-function simulateFrame(localInputs = null) {
-  if (role === 'local') {
-    simulateGameFrame(localInputs || [inputFor(0), inputFor(1)]);
-    simulationFrame += 1;
-    return;
-  }
-  if (!onlineStarted || syncPaused || !channel?.open) {
-    return;
-  }
-
-  const frame = simulationFrame;
-  const localPlayer = role === 'host' ? 0 : 1;
-  const remotePlayer = 1 - localPlayer;
-  const inputs = [];
-  inputs[localPlayer] = normalizeInput(localInputs || inputFor(localPlayer));
-  inputs[remotePlayer] = remoteInputForFrame(frame, remotePlayer);
-  frameInputs.set(frame, inputs.map(normalizeInput));
-  frameStates.set(frame, cloneState());
-  simulateGameFrame(inputs);
-  simulationFrame = frame + 1;
-  pruneRollbackHistory();
-  send({
-    type: 'input',
-    protocol: PROTOCOL_VERSION,
-    epoch: syncEpoch,
-    frame,
-    input: inputs[localPlayer],
-  });
-}
-
-function inputsMatch(first, second) {
-  return inputActions.every((action) => Boolean(first?.[action]) === Boolean(second?.[action]));
-}
-
-function rollbackFrom(frame) {
-  const startState = frameStates.get(frame);
-  if (!startState) {
-    pauseForResync(frame);
-    return;
-  }
-
-  const endFrame = simulationFrame;
-  for (let replayFrame = frame; replayFrame < endFrame; replayFrame += 1) {
-    if (!frameInputs.has(replayFrame)) {
-      pauseForResync(replayFrame);
-      return;
-    }
-  }
-
-  const localPlayer = role === 'host' ? 0 : 1;
-  const remotePlayer = 1 - localPlayer;
-  restoreState(startState);
-  for (let replayFrame = frame; replayFrame < endFrame; replayFrame += 1) {
-    const savedInputs = frameInputs.get(replayFrame);
-    const inputs = [];
-    inputs[localPlayer] = savedInputs[localPlayer];
-    inputs[remotePlayer] = remoteInputForFrame(replayFrame, remotePlayer);
-    frameStates.set(replayFrame, cloneState());
-    frameInputs.set(replayFrame, inputs.map(normalizeInput));
-    simulateGameFrame(inputs);
-    simulationFrame = replayFrame + 1;
-  }
-  pruneRollbackHistory();
-}
-
-function receiveRemoteInput(message) {
-  if (
-    message.protocol !== PROTOCOL_VERSION ||
-    message.epoch !== syncEpoch ||
-    !Number.isInteger(message.frame) ||
-    message.frame < 0 ||
-    !message.input ||
-    typeof message.input !== 'object' ||
-    Array.isArray(message.input)
-  ) {
-    return;
-  }
-  const frame = message.frame;
-  if (frame > simulationFrame + MAX_ROLLBACK_FRAMES) {
-    pauseForResync(frame);
-    return;
-  }
-  const input = normalizeInput(message.input);
-  const existing = receivedRemoteInputs.get(frame);
-  if (existing && inputsMatch(existing, input)) {
-    return;
-  }
-  receivedRemoteInputs.set(frame, input);
-  if (frame >= simulationFrame) {
-    return;
-  }
-
-  const usedInput = frameInputs.get(frame)?.[role === 'host' ? 1 : 0];
-  if (!usedInput) {
-    pauseForResync(frame);
-  } else if (!inputsMatch(usedInput, input)) {
-    rollbackFrom(frame);
-  }
-}
-
-function pauseForResync(frame) {
-  if (syncPaused || !channel?.open) {
-    return;
-  }
-  syncPaused = true;
-  if (role === 'host') {
-    const token = ++resyncTokenSequence;
-    pendingResyncToken = token;
-    syncEpoch += 1;
-    send({
-      type: 'resync-state',
-      protocol: PROTOCOL_VERSION,
-      token,
-      epoch: syncEpoch,
-      frame: simulationFrame,
-      state: cloneState(),
-    });
-  } else {
-    const token = ++resyncTokenSequence;
-    pendingResyncToken = token;
-    send({
-      type: 'resync-request',
-      protocol: PROTOCOL_VERSION,
-      token,
-      epoch: syncEpoch,
-      frame,
-    });
-  }
-  setConnectionStatus('通信遅延のため同期中です。ゲーム進行を一時停止しています。');
-}
-
-function acceptResyncState(message) {
-  if (
-    message.protocol !== PROTOCOL_VERSION ||
-    !Number.isInteger(message.token) ||
-    !Number.isInteger(message.epoch) ||
-    !Number.isInteger(message.frame) ||
-    message.frame < 0 ||
-    !isValidState(message.state)
-  ) {
-    setConnectionStatus('受信した同期データが不正です。接続をやり直してください。');
-    return;
-  }
-  if (role === 'guest' && pendingResyncToken !== null && pendingResyncToken !== message.token) {
-    return;
-  }
-  syncPaused = true;
-  syncEpoch = message.epoch;
-  simulationFrame = message.frame;
-  simulationAccumulator = 0;
-  restoreState(message.state);
-  clearRollbackHistory();
-  pendingResyncToken = message.token;
-  send({
-    type: 'resync-ack',
-    protocol: PROTOCOL_VERSION,
-    token: message.token,
-    epoch: syncEpoch,
-  });
-  if (role === 'guest') {
-    syncPaused = false;
-    pendingResyncToken = null;
-    setConnectionStatus('オンライン対戦中（同期を再開しました）');
-  }
-}
-
-function beginOnlineRound(message) {
-  if (
-    message.protocol !== PROTOCOL_VERSION ||
-    !Number.isInteger(message.epoch) ||
-    !Number.isInteger(message.frame) ||
-    message.frame < 0 ||
-    !isValidState(message.state)
-  ) {
-    setConnectionStatus('通信相手のゲームバージョンが異なります。両方を再読み込みしてください。');
-    return;
-  }
-  clearTimeout(handshakeTimeout);
-  handshakeTimeout = null;
-  syncEpoch = message.epoch;
-  simulationFrame = message.frame;
-  simulationAccumulator = 0;
-  restoreState(message.state);
-  onlineStarted = true;
-  syncPaused = false;
-  pendingResyncToken = null;
-  clearRollbackHistory();
-  lastFrame = performance.now();
-  setConnectionStatus(`オンライン対戦中（${role === 'host' ? 'ホスト' : 'ゲスト'}）`);
-}
-
-function startOnlineRound() {
-  resetRound();
-  syncEpoch += 1;
-  onlineStarted = true;
-  lastFrame = performance.now();
-  send({
-    type: 'round-start',
-    protocol: PROTOCOL_VERSION,
-    epoch: syncEpoch,
-    frame: simulationFrame,
-    state: cloneState(),
-  });
-  setConnectionStatus(`オンライン対戦中（${role === 'host' ? 'ホスト' : 'ゲスト'}）`);
-}
-
 function updateFrameMeter() {
   const frameMeter = document.getElementById('frameMeter');
-  frameMeter.hidden = role !== 'local';
+  frameMeter.hidden = network?.role !== 'local';
   if (frameMeter.hidden) {
     return;
   }
@@ -712,17 +436,10 @@ function draw() {
 function loop(now) {
   const deltaTime = Math.min(250, now - lastFrame);
   lastFrame = now;
-  simulationAccumulator += deltaTime;
-  let steps = 0;
-  while (simulationAccumulator >= FIXED_STEP_MS && steps < MAX_STEPS_PER_RENDER) {
-    simulateFrame();
-    simulationAccumulator -= FIXED_STEP_MS;
-    steps += 1;
+  if (!gameOver) {
+    network.advance(deltaTime);
   }
-  if (channel?.open && now - pingAt > 700) {
-    send({ type: 'ping', t: now });
-    pingAt = now;
-  }
+  network.tick(now);
   draw();
   requestAnimationFrame(loop);
 }
@@ -742,267 +459,20 @@ window.addEventListener('blur', () => {
   keys.clear();
 });
 
-function send(message) {
-  if (!channel?.open) {
-    return;
-  }
-  try {
-    channel.send(message);
-  } catch (error) {
-    setConnectionStatus(`通信エラー: ${error.message}`);
-  }
-}
-
-function setConnectionStatus(message) {
-  connectionStatus.textContent = message;
-}
-
-function closePeer() {
-  const oldPeer = peer;
-  const oldChannel = channel;
-  peer = null;
-  channel = null;
-  clearTimeout(handshakeTimeout);
-  handshakeTimeout = null;
-  onlineStarted = false;
-  syncPaused = false;
-  oldChannel?.close();
-  oldPeer?.destroy();
-}
-
-function createPeer() {
-  if (!window.Peer) {
-    throw new Error('PeerJSを読み込めません。インターネット接続を確認してページを再読み込みしてください。');
-  }
-  const currentPeer = new Peer();
-  peer = currentPeer;
-  currentPeer.on('error', (error) => {
-    if (peer !== currentPeer) {
-      return;
-    }
-    const messages = {
-      'peer-unavailable': '部屋が見つかりません。コードを確認してください。',
-      network: '接続サービスに接続できません。',
-      'server-error': '接続サービスでエラーが発生しました。',
-      'unavailable-id': '部屋を作成できません。もう一度お試しください。',
-    };
-    setConnectionStatus(messages[error.type] || `接続エラー: ${error.message}`);
-  });
-  return currentPeer;
-}
-
-function setupChannel(connection) {
-  if (channel && channel !== connection) {
-    connection.close();
-    return;
-  }
-  channel = connection;
-  connection.on('open', () => {
-    if (channel !== connection) {
-      return;
-    }
-    setConnectionStatus('ゲームのバージョンを確認しています…');
-    handshakeTimeout = setTimeout(() => {
-      if (channel === connection && !onlineStarted) {
-        setConnectionStatus('相手と通信バージョンを確認できません。両方のページを最新版にしてください。');
-      }
-    }, 5000);
-    send({ type: 'hello', protocol: PROTOCOL_VERSION });
-  });
-  connection.on('close', () => {
-    if (channel === connection) {
-      channel = null;
-      clearTimeout(handshakeTimeout);
-      handshakeTimeout = null;
-      onlineStarted = false;
-      syncPaused = false;
-      setConnectionStatus('通信が切断されました');
-    }
-  });
-  connection.on('error', (error) => {
-    if (channel === connection) {
-      setConnectionStatus(`通信エラー: ${error.message}`);
-    }
-  });
-  connection.on('data', (message) => {
-    if (!message || typeof message !== 'object') {
-      return;
-    }
-    if (message.type === 'hello') {
-      if (message.protocol !== PROTOCOL_VERSION) {
-        setConnectionStatus('通信相手のゲームバージョンが異なります。両方を再読み込みしてください。');
-        return;
-      }
-      clearTimeout(handshakeTimeout);
-      handshakeTimeout = null;
-      if (role === 'host' && !onlineStarted) {
-        startOnlineRound();
-      } else if (role === 'guest' && !onlineStarted) {
-        setConnectionStatus('通信バージョンを確認しました。ホストの開始を待っています…');
-      }
-    } else if (message.type === 'round-start' && role === 'guest') {
-      beginOnlineRound(message);
-    } else if (message.type === 'input') {
-      receiveRemoteInput(message);
-    } else if (message.type === 'resync-request' && role === 'host') {
-      if (
-        message.protocol !== PROTOCOL_VERSION ||
-        message.epoch !== syncEpoch ||
-        !Number.isInteger(message.token)
-      ) {
-        return;
-      }
-      syncPaused = true;
-      pendingResyncToken = message.token;
-      syncEpoch += 1;
-      send({
-        type: 'resync-state',
-        protocol: PROTOCOL_VERSION,
-        token: message.token,
-        epoch: syncEpoch,
-        frame: simulationFrame,
-        state: cloneState(),
-      });
-      clearRollbackHistory();
-      setConnectionStatus('通信遅延のため同期中です。ゲーム進行を一時停止しています。');
-    } else if (message.type === 'resync-state' && role === 'guest') {
-      acceptResyncState(message);
-    } else if (
-      message.type === 'resync-ack' &&
-      role === 'host' &&
-      syncPaused &&
-      message.protocol === PROTOCOL_VERSION &&
-      message.token === pendingResyncToken &&
-      message.epoch === syncEpoch
-    ) {
-      pendingResyncToken = null;
-      syncPaused = false;
-      clearRollbackHistory();
-      setConnectionStatus('オンライン対戦中（同期を再開しました）');
-    } else if (
-      message.type === 'rematch' &&
-      role === 'host' &&
-      message.protocol === PROTOCOL_VERSION &&
-      message.epoch === syncEpoch
-    ) {
-      startOnlineRound();
-    } else if (message.type === 'ping') {
-      send({ type: 'pong', t: message.t });
-    } else if (message.type === 'pong') {
-      const roundTripTime = Math.round(performance.now() - message.t);
-      if (!syncPaused && onlineStarted) {
-        setConnectionStatus(`オンライン対戦中（往復 ${roundTripTime} ms）`);
-      }
-    }
-  });
-}
-
-document.getElementById('createRoomBtn').addEventListener('click', () => {
-  closePeer();
-  role = 'host';
-  updateFrameMeter();
-  resetRound();
-  const roomCodeInput = document.getElementById('roomCode');
-  const copyButton = document.getElementById('copyRoomBtn');
-  roomCodeInput.value = '';
-  copyButton.disabled = true;
-  setConnectionStatus('部屋を作成しています…');
-  try {
-    const hostPeer = createPeer();
-    hostPeer.on('open', (id) => {
-      if (peer === hostPeer) {
-        roomCodeInput.value = id;
-        copyButton.disabled = false;
-        setConnectionStatus('部屋を作成しました。コードを相手に共有してください。');
-      }
-    });
-    hostPeer.on('connection', (connection) => {
-      if (channel) {
-        connection.close();
-        return;
-      }
-      setConnectionStatus('参加者の接続を待っています…');
-      setupChannel(connection);
-    });
-  } catch (error) {
-    setConnectionStatus(error.message);
-  }
+network = new RollbackNetwork({
+  captureState: cloneState,
+  restoreState,
+  isValidState,
+  simulateFrame: simulateGameFrame,
+  inputFor,
+  resetRound,
+  resetClock: () => {
+    lastFrame = performance.now();
+  },
+  roleChanged: updateFrameMeter,
+  setConnectionStatus: (message) => {
+    connectionStatus.textContent = message;
+  },
 });
-
-document.getElementById('copyRoomBtn').addEventListener('click', async () => {
-  const roomCodeInput = document.getElementById('roomCode');
-  if (!roomCodeInput.value) {
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(roomCodeInput.value);
-    setConnectionStatus('部屋コードをコピーしました。');
-  } catch (error) {
-    roomCodeInput.select();
-    const copied = document.execCommand('copy');
-    setConnectionStatus(
-      copied ? '部屋コードをコピーしました。' : `コピーできませんでした: ${error.message}`,
-    );
-  }
-});
-
-document.getElementById('joinRoomBtn').addEventListener('click', () => {
-  const code = document.getElementById('joinCodeInput').value.trim();
-  if (!code) {
-    setConnectionStatus('参加する部屋コードを入力してください。');
-    return;
-  }
-  closePeer();
-  role = 'guest';
-  updateFrameMeter();
-  resetRound();
-  setConnectionStatus('部屋に接続しています…');
-  try {
-    const guestPeer = createPeer();
-    guestPeer.on('open', () => {
-      if (peer === guestPeer) {
-        setupChannel(guestPeer.connect(code, {
-          reliable: true,
-          serialization: 'json',
-        }));
-      }
-    });
-  } catch (error) {
-    setConnectionStatus(error.message);
-  }
-});
-
-document.getElementById('resetConnectionBtn').addEventListener('click', () => {
-  closePeer();
-  role = 'local';
-  updateFrameMeter();
-  resetRound();
-  document.getElementById('roomCode').value = '';
-  document.getElementById('joinCodeInput').value = '';
-  document.getElementById('copyRoomBtn').disabled = true;
-  setConnectionStatus('ローカル2人プレイ');
-});
-
-document.getElementById('restart').addEventListener('click', () => {
-  if (role === 'guest') {
-    if (!channel?.open) {
-      setConnectionStatus('通信が接続されていません');
-      return;
-    }
-    send({ type: 'rematch', protocol: PROTOCOL_VERSION, epoch: syncEpoch });
-    setConnectionStatus('ホストに再戦をリクエストしました');
-    return;
-  }
-  if (role === 'host') {
-    if (!channel?.open) {
-      setConnectionStatus('通信が接続されていません');
-      return;
-    }
-    startOnlineRound();
-  } else {
-    resetRound();
-  }
-});
-
-resetRound();
+updateFrameMeter();
 requestAnimationFrame(loop);

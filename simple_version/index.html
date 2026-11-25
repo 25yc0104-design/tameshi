@@ -6,7 +6,7 @@
     <title>DUEL / Simple Fighter</title>
     <link rel="stylesheet" href="styles.css">
     <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" defer></script>
-    <script src="game.js" defer></script>
+    <script type="module" src="game.js"></script>
   </head>
   <body>
     <main class="game-shell">
@@ -91,6 +91,14 @@
         <h2>オンライン対戦</h2>
         <p id="connectionStatus" role="status">ローカル2人プレイ</p>
         <div class="network-actions">
+          <input
+            id="createRoomCodeInput"
+            aria-label="作成する部屋コード"
+            placeholder="使いたい部屋コード（空欄なら自動生成）"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          >
           <button id="createRoomBtn" type="button">部屋を作成</button>
           <input
             id="roomCode"
@@ -111,8 +119,9 @@
           <button id="resetConnectionBtn" type="button">切断してローカルに戻る</button>
         </div>
         <p class="network-note">
-          ホストが部屋を作成し、部屋コードを共有してください。参加者はコードを入力して参加します。
-          接続にはPeerJSの公開サービスを利用します。
+          ホストが部屋を作成し、表示されたコードを共有してください。参加者はコードを入力して参加します。
+          カスタムコードは接続先IDであり、パスワード認証ではありません。知っている人は誰でも参加を試せます。
+          英数字・ハイフン・アンダースコアが使えます。空欄ならコードを自動生成します。接続にはPeerJSの公開サービスを利用します。
         </p>
       </section>
     </main>
