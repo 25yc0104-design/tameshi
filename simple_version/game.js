@@ -10,13 +10,22 @@ const connectionStatus = document.getElementById('connectionStatus');
 let peer = null;
 let channel = null;
 let role = 'local';
-let remoteInput = [{}, {}];
-let lastInputSent = 0;
-let lastStateSent = 0;
 let pingAt = 0;
-const snapshotBuffer = [];
-const snapshotDelay = 50;
-const maxSnapshots = 30;
+let handshakeTimeout = null;
+const FIXED_STEP_MS = 1000 / 60;
+const MAX_ROLLBACK_FRAMES = 180;
+const MAX_STEPS_PER_RENDER = 5;
+const PROTOCOL_VERSION = 2;
+let simulationAccumulator = 0;
+let simulationFrame = 0;
+let onlineStarted = false;
+let syncPaused = false;
+let syncEpoch = 0;
+let pendingResyncToken = null;
+let resyncTokenSequence = 0;
+const frameInputs = new Map();
+const receivedRemoteInputs = new Map();
+const frameStates = new Map();
 
 const keymap = [
   {
@@ -91,24 +100,21 @@ function resetRound() {
     createFighter(250, 1, '#d4fa58', '#788f31'),
     createFighter(710, -1, '#ff765f', '#a5423a'),
   ];
-  snapshotBuffer.length = 0;
   previousInput = [{}, {}];
-  remoteInput = [{}, {}];
   remaining = 99;
   gameOver = false;
   screenShake = 0;
+  simulationFrame = 0;
+  simulationAccumulator = 0;
+  onlineStarted = role === 'local';
+  syncPaused = false;
+  pendingResyncToken = null;
+  clearRollbackHistory();
   resultDisplay.textContent = '';
   updateHud();
 }
 
 function inputFor(player) {
-  const isLocalPlayer =
-    role === 'local' ||
-    (role === 'host' && player === 0) ||
-    (role === 'guest' && player === 1);
-  if (!isLocalPlayer) {
-    return remoteInput[player] || {};
-  }
   const layout = keymap[player];
   const input = {};
   for (const [action, code] of Object.entries(layout)) {
@@ -128,13 +134,13 @@ function startAttack(fighter, kind) {
   fighter.attackId += 1;
 }
 
-function updateGame(deltaTime) {
-  if (gameOver || role === 'guest' || (role === 'host' && !channel?.open)) {
+function simulateGameFrame(inputs) {
+  if (gameOver) {
+    screenShake = Math.max(0, screenShake - 0.7);
     return;
   }
 
-  const frameScale = deltaTime / 16.667;
-  const inputs = [inputFor(0), inputFor(1)];
+  const frameScale = 1;
 
   for (let index = 0; index < fighters.length; index += 1) {
     const fighter = fighters[index];
@@ -143,7 +149,7 @@ function updateGame(deltaTime) {
     fighter.guardFlash = Math.max(0, fighter.guardFlash - frameScale);
 
     if (fighter.stun > 0) {
-      fighter.stun = Math.max(0, fighter.stun - deltaTime);
+      fighter.stun = Math.max(0, fighter.stun - frameScale);
       fighter.guard = false;
       previousInput[index] = input;
       continue;
@@ -232,7 +238,8 @@ function updateGame(deltaTime) {
     previousInput[index] = input;
   }
 
-  remaining = Math.max(0, remaining - deltaTime / 1000);
+  screenShake = Math.max(0, screenShake - 0.7);
+  remaining = Math.max(0, remaining - 1 / 60);
   if (fighters.some((fighter) => fighter.hp <= 0) || remaining === 0) {
     gameOver = true;
   }
@@ -305,6 +312,7 @@ function drawFighter(fighter) {
 
 function drawGameOver() {
   if (!gameOver) {
+    resultDisplay.textContent = '';
     return;
   }
   ctx.fillStyle = '#0c1110aa';
@@ -324,56 +332,305 @@ function updateHud() {
   timerDisplay.textContent = String(Math.ceil(remaining)).padStart(2, '0');
 }
 
-function addSnapshot(snapshot) {
-  const receivedAt = performance.now();
-  const snapshotFighters = snapshot.fighters.map((fighter) => ({ ...fighter }));
-  snapshotBuffer.push({ receivedAt, fighters: snapshotFighters });
-  if (snapshotBuffer.length > maxSnapshots) {
-    snapshotBuffer.shift();
+const inputActions = ['left', 'right', 'jump', 'down', 'weak', 'medium', 'strong', 'special'];
+
+function normalizeInput(input) {
+  const normalized = {};
+  for (const action of inputActions) {
+    normalized[action] = Boolean(input?.[action]);
   }
-  fighters = snapshotFighters;
-  remaining = snapshot.remaining;
-  gameOver = snapshot.gameOver;
+  return normalized;
 }
 
-function getRenderedFighters(now) {
-  if (role !== 'guest' || snapshotBuffer.length === 0) {
-    return fighters;
-  }
+function neutralInput() {
+  return normalizeInput({});
+}
 
-  const targetTime = now - snapshotDelay;
-  let before = snapshotBuffer[0];
-  let after = null;
-  for (const snapshot of snapshotBuffer) {
-    if (snapshot.receivedAt <= targetTime) {
-      before = snapshot;
-    }
-    if (snapshot.receivedAt >= targetTime) {
-      after = snapshot;
-      break;
-    }
-  }
+function cloneState() {
+  return {
+    fighters: fighters.map((fighter) => ({ ...fighter })),
+    previousInput: previousInput.map((input) => ({ ...input })),
+    remaining,
+    gameOver,
+    screenShake,
+  };
+}
 
-  while (snapshotBuffer.length > 2 && snapshotBuffer[1].receivedAt <= targetTime) {
-    snapshotBuffer.shift();
-  }
+function restoreState(state) {
+  fighters = state.fighters.map((fighter) => ({ ...fighter }));
+  previousInput = state.previousInput.map((input) => ({ ...input }));
+  remaining = state.remaining;
+  gameOver = state.gameOver;
+  screenShake = state.screenShake;
+}
 
-  if (!after || after === before || after.receivedAt <= before.receivedAt) {
-    return before.fighters;
+function isValidState(state) {
+  if (
+    !state ||
+    !Array.isArray(state.fighters) ||
+    state.fighters.length !== 2 ||
+    !Array.isArray(state.previousInput) ||
+    state.previousInput.length !== 2 ||
+    !Number.isFinite(state.remaining) ||
+    typeof state.gameOver !== 'boolean' ||
+    !Number.isFinite(state.screenShake)
+  ) {
+    return false;
   }
-
-  const progress = Math.max(
-    0,
-    Math.min(1, (targetTime - before.receivedAt) / (after.receivedAt - before.receivedAt)),
+  const fighterNumbers = [
+    'x', 'y', 'vy', 'jumpDir', 'hp', 'facing', 'attack', 'attackFrame',
+    'attackKind', 'attackId', 'hitId', 'stun', 'guardFlash',
+  ];
+  return state.fighters.every((fighter) =>
+    fighter &&
+    fighterNumbers.every((key) => Number.isFinite(fighter[key])) &&
+    typeof fighter.onGround === 'boolean' &&
+    typeof fighter.guard === 'boolean' &&
+    typeof fighter.color === 'string' &&
+    typeof fighter.darkColor === 'string',
+  ) && state.previousInput.every((input) =>
+    input && typeof input === 'object' && !Array.isArray(input),
   );
-  return before.fighters.map((fighter, index) => {
-    const nextFighter = after.fighters[index];
-    return {
-      ...fighter,
-      x: fighter.x + (nextFighter.x - fighter.x) * progress,
-      y: fighter.y + (nextFighter.y - fighter.y) * progress,
-    };
+}
+
+function clearRollbackHistory() {
+  frameInputs.clear();
+  receivedRemoteInputs.clear();
+  frameStates.clear();
+  frameStates.set(simulationFrame, cloneState());
+}
+
+function pruneRollbackHistory() {
+  const oldestFrame = simulationFrame - MAX_ROLLBACK_FRAMES;
+  for (const frame of frameInputs.keys()) {
+    if (frame < oldestFrame - 1) {
+      frameInputs.delete(frame);
+    }
+  }
+  for (const frame of receivedRemoteInputs.keys()) {
+    if (frame < oldestFrame) {
+      receivedRemoteInputs.delete(frame);
+    }
+  }
+  for (const frame of frameStates.keys()) {
+    if (frame < oldestFrame) {
+      frameStates.delete(frame);
+    }
+  }
+}
+
+function remoteInputForFrame(frame, remotePlayer) {
+  const received = receivedRemoteInputs.get(frame);
+  if (received) {
+    return received;
+  }
+  return frameInputs.get(frame - 1)?.[remotePlayer] || neutralInput();
+}
+
+function simulateFrame(localInputs = null) {
+  if (role === 'local') {
+    simulateGameFrame(localInputs || [inputFor(0), inputFor(1)]);
+    simulationFrame += 1;
+    return;
+  }
+  if (!onlineStarted || syncPaused || !channel?.open) {
+    return;
+  }
+
+  const frame = simulationFrame;
+  const localPlayer = role === 'host' ? 0 : 1;
+  const remotePlayer = 1 - localPlayer;
+  const inputs = [];
+  inputs[localPlayer] = normalizeInput(localInputs || inputFor(localPlayer));
+  inputs[remotePlayer] = remoteInputForFrame(frame, remotePlayer);
+  frameInputs.set(frame, inputs.map(normalizeInput));
+  frameStates.set(frame, cloneState());
+  simulateGameFrame(inputs);
+  simulationFrame = frame + 1;
+  pruneRollbackHistory();
+  send({
+    type: 'input',
+    protocol: PROTOCOL_VERSION,
+    epoch: syncEpoch,
+    frame,
+    input: inputs[localPlayer],
   });
+}
+
+function inputsMatch(first, second) {
+  return inputActions.every((action) => Boolean(first?.[action]) === Boolean(second?.[action]));
+}
+
+function rollbackFrom(frame) {
+  const startState = frameStates.get(frame);
+  if (!startState) {
+    pauseForResync(frame);
+    return;
+  }
+
+  const endFrame = simulationFrame;
+  for (let replayFrame = frame; replayFrame < endFrame; replayFrame += 1) {
+    if (!frameInputs.has(replayFrame)) {
+      pauseForResync(replayFrame);
+      return;
+    }
+  }
+
+  const localPlayer = role === 'host' ? 0 : 1;
+  const remotePlayer = 1 - localPlayer;
+  restoreState(startState);
+  for (let replayFrame = frame; replayFrame < endFrame; replayFrame += 1) {
+    const savedInputs = frameInputs.get(replayFrame);
+    const inputs = [];
+    inputs[localPlayer] = savedInputs[localPlayer];
+    inputs[remotePlayer] = remoteInputForFrame(replayFrame, remotePlayer);
+    frameStates.set(replayFrame, cloneState());
+    frameInputs.set(replayFrame, inputs.map(normalizeInput));
+    simulateGameFrame(inputs);
+    simulationFrame = replayFrame + 1;
+  }
+  pruneRollbackHistory();
+}
+
+function receiveRemoteInput(message) {
+  if (
+    message.protocol !== PROTOCOL_VERSION ||
+    message.epoch !== syncEpoch ||
+    !Number.isInteger(message.frame) ||
+    message.frame < 0 ||
+    !message.input ||
+    typeof message.input !== 'object' ||
+    Array.isArray(message.input)
+  ) {
+    return;
+  }
+  const frame = message.frame;
+  if (frame > simulationFrame + MAX_ROLLBACK_FRAMES) {
+    pauseForResync(frame);
+    return;
+  }
+  const input = normalizeInput(message.input);
+  const existing = receivedRemoteInputs.get(frame);
+  if (existing && inputsMatch(existing, input)) {
+    return;
+  }
+  receivedRemoteInputs.set(frame, input);
+  if (frame >= simulationFrame) {
+    return;
+  }
+
+  const usedInput = frameInputs.get(frame)?.[role === 'host' ? 1 : 0];
+  if (!usedInput) {
+    pauseForResync(frame);
+  } else if (!inputsMatch(usedInput, input)) {
+    rollbackFrom(frame);
+  }
+}
+
+function pauseForResync(frame) {
+  if (syncPaused || !channel?.open) {
+    return;
+  }
+  syncPaused = true;
+  if (role === 'host') {
+    const token = ++resyncTokenSequence;
+    pendingResyncToken = token;
+    syncEpoch += 1;
+    send({
+      type: 'resync-state',
+      protocol: PROTOCOL_VERSION,
+      token,
+      epoch: syncEpoch,
+      frame: simulationFrame,
+      state: cloneState(),
+    });
+  } else {
+    const token = ++resyncTokenSequence;
+    pendingResyncToken = token;
+    send({
+      type: 'resync-request',
+      protocol: PROTOCOL_VERSION,
+      token,
+      epoch: syncEpoch,
+      frame,
+    });
+  }
+  setConnectionStatus('通信遅延のため同期中です。ゲーム進行を一時停止しています。');
+}
+
+function acceptResyncState(message) {
+  if (
+    message.protocol !== PROTOCOL_VERSION ||
+    !Number.isInteger(message.token) ||
+    !Number.isInteger(message.epoch) ||
+    !Number.isInteger(message.frame) ||
+    message.frame < 0 ||
+    !isValidState(message.state)
+  ) {
+    setConnectionStatus('受信した同期データが不正です。接続をやり直してください。');
+    return;
+  }
+  if (role === 'guest' && pendingResyncToken !== null && pendingResyncToken !== message.token) {
+    return;
+  }
+  syncPaused = true;
+  syncEpoch = message.epoch;
+  simulationFrame = message.frame;
+  simulationAccumulator = 0;
+  restoreState(message.state);
+  clearRollbackHistory();
+  pendingResyncToken = message.token;
+  send({
+    type: 'resync-ack',
+    protocol: PROTOCOL_VERSION,
+    token: message.token,
+    epoch: syncEpoch,
+  });
+  if (role === 'guest') {
+    syncPaused = false;
+    pendingResyncToken = null;
+    setConnectionStatus('オンライン対戦中（同期を再開しました）');
+  }
+}
+
+function beginOnlineRound(message) {
+  if (
+    message.protocol !== PROTOCOL_VERSION ||
+    !Number.isInteger(message.epoch) ||
+    !Number.isInteger(message.frame) ||
+    message.frame < 0 ||
+    !isValidState(message.state)
+  ) {
+    setConnectionStatus('通信相手のゲームバージョンが異なります。両方を再読み込みしてください。');
+    return;
+  }
+  clearTimeout(handshakeTimeout);
+  handshakeTimeout = null;
+  syncEpoch = message.epoch;
+  simulationFrame = message.frame;
+  simulationAccumulator = 0;
+  restoreState(message.state);
+  onlineStarted = true;
+  syncPaused = false;
+  pendingResyncToken = null;
+  clearRollbackHistory();
+  lastFrame = performance.now();
+  setConnectionStatus(`オンライン対戦中（${role === 'host' ? 'ホスト' : 'ゲスト'}）`);
+}
+
+function startOnlineRound() {
+  resetRound();
+  syncEpoch += 1;
+  onlineStarted = true;
+  lastFrame = performance.now();
+  send({
+    type: 'round-start',
+    protocol: PROTOCOL_VERSION,
+    epoch: syncEpoch,
+    frame: simulationFrame,
+    state: cloneState(),
+  });
+  setConnectionStatus(`オンライン対戦中（${role === 'host' ? 'ホスト' : 'ゲスト'}）`);
 }
 
 function updateFrameMeter() {
@@ -440,38 +697,33 @@ function updateFrameMeter() {
   });
 }
 
-function draw(now) {
+function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.save();
   ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake);
   drawArena();
-  getRenderedFighters(now).forEach(drawFighter);
+  fighters.forEach(drawFighter);
   ctx.restore();
-  screenShake = Math.max(0, screenShake - 0.7);
   drawGameOver();
   updateHud();
   updateFrameMeter();
 }
 
 function loop(now) {
-  const deltaTime = Math.min(40, now - lastFrame);
+  const deltaTime = Math.min(250, now - lastFrame);
   lastFrame = now;
-  if (!gameOver) {
-    updateGame(deltaTime);
-    if (role === 'guest' && now - lastInputSent > 25) {
-      send({ type: 'input', input: inputFor(1) });
-      lastInputSent = now;
-    }
-    if (role === 'host' && now - lastStateSent >= 1000 / 60) {
-      send({ type: 'state', fighters, remaining, gameOver });
-      lastStateSent = now;
-    }
-    if (channel?.open && now - pingAt > 700) {
-      send({ type: 'ping', t: now });
-      pingAt = now;
-    }
+  simulationAccumulator += deltaTime;
+  let steps = 0;
+  while (simulationAccumulator >= FIXED_STEP_MS && steps < MAX_STEPS_PER_RENDER) {
+    simulateFrame();
+    simulationAccumulator -= FIXED_STEP_MS;
+    steps += 1;
   }
-  draw(now);
+  if (channel?.open && now - pingAt > 700) {
+    send({ type: 'ping', t: now });
+    pingAt = now;
+  }
+  draw();
   requestAnimationFrame(loop);
 }
 
@@ -510,6 +762,10 @@ function closePeer() {
   const oldChannel = channel;
   peer = null;
   channel = null;
+  clearTimeout(handshakeTimeout);
+  handshakeTimeout = null;
+  onlineStarted = false;
+  syncPaused = false;
   oldChannel?.close();
   oldPeer?.destroy();
 }
@@ -545,15 +801,21 @@ function setupChannel(connection) {
     if (channel !== connection) {
       return;
     }
-    setConnectionStatus(`オンライン接続中（${role === 'host' ? 'ホスト' : '参加者'}）`);
-    if (role === 'host') {
-      send({ type: 'state', fighters, remaining, gameOver });
-    }
+    setConnectionStatus('ゲームのバージョンを確認しています…');
+    handshakeTimeout = setTimeout(() => {
+      if (channel === connection && !onlineStarted) {
+        setConnectionStatus('相手と通信バージョンを確認できません。両方のページを最新版にしてください。');
+      }
+    }, 5000);
+    send({ type: 'hello', protocol: PROTOCOL_VERSION });
   });
   connection.on('close', () => {
     if (channel === connection) {
       channel = null;
-      snapshotBuffer.length = 0;
+      clearTimeout(handshakeTimeout);
+      handshakeTimeout = null;
+      onlineStarted = false;
+      syncPaused = false;
       setConnectionStatus('通信が切断されました');
     }
   });
@@ -566,27 +828,71 @@ function setupChannel(connection) {
     if (!message || typeof message !== 'object') {
       return;
     }
-    if (message.type === 'input' && role === 'host' && message.input) {
-      remoteInput[1] = message.input;
-    } else if (message.type === 'state' && role === 'guest') {
-      if (!Array.isArray(message.fighters) || message.fighters.length !== 2) {
+    if (message.type === 'hello') {
+      if (message.protocol !== PROTOCOL_VERSION) {
+        setConnectionStatus('通信相手のゲームバージョンが異なります。両方を再読み込みしてください。');
         return;
       }
-      if (message.rematch) {
-        snapshotBuffer.length = 0;
+      clearTimeout(handshakeTimeout);
+      handshakeTimeout = null;
+      if (role === 'host' && !onlineStarted) {
+        startOnlineRound();
+      } else if (role === 'guest' && !onlineStarted) {
+        setConnectionStatus('通信バージョンを確認しました。ホストの開始を待っています…');
       }
-      addSnapshot(message);
-      if (message.rematch) {
-        setConnectionStatus('オンライン接続中（参加者）');
+    } else if (message.type === 'round-start' && role === 'guest') {
+      beginOnlineRound(message);
+    } else if (message.type === 'input') {
+      receiveRemoteInput(message);
+    } else if (message.type === 'resync-request' && role === 'host') {
+      if (
+        message.protocol !== PROTOCOL_VERSION ||
+        message.epoch !== syncEpoch ||
+        !Number.isInteger(message.token)
+      ) {
+        return;
       }
-    } else if (message.type === 'rematch' && role === 'host') {
-      resetRound();
-      send({ type: 'state', fighters, remaining, gameOver, rematch: true });
+      syncPaused = true;
+      pendingResyncToken = message.token;
+      syncEpoch += 1;
+      send({
+        type: 'resync-state',
+        protocol: PROTOCOL_VERSION,
+        token: message.token,
+        epoch: syncEpoch,
+        frame: simulationFrame,
+        state: cloneState(),
+      });
+      clearRollbackHistory();
+      setConnectionStatus('通信遅延のため同期中です。ゲーム進行を一時停止しています。');
+    } else if (message.type === 'resync-state' && role === 'guest') {
+      acceptResyncState(message);
+    } else if (
+      message.type === 'resync-ack' &&
+      role === 'host' &&
+      syncPaused &&
+      message.protocol === PROTOCOL_VERSION &&
+      message.token === pendingResyncToken &&
+      message.epoch === syncEpoch
+    ) {
+      pendingResyncToken = null;
+      syncPaused = false;
+      clearRollbackHistory();
+      setConnectionStatus('オンライン対戦中（同期を再開しました）');
+    } else if (
+      message.type === 'rematch' &&
+      role === 'host' &&
+      message.protocol === PROTOCOL_VERSION &&
+      message.epoch === syncEpoch
+    ) {
+      startOnlineRound();
     } else if (message.type === 'ping') {
       send({ type: 'pong', t: message.t });
     } else if (message.type === 'pong') {
       const roundTripTime = Math.round(performance.now() - message.t);
-      setConnectionStatus(`オンライン接続中（往復 ${roundTripTime} ms）`);
+      if (!syncPaused && onlineStarted) {
+        setConnectionStatus(`オンライン対戦中（往復 ${roundTripTime} ms）`);
+      }
     }
   });
 }
@@ -594,6 +900,7 @@ function setupChannel(connection) {
 document.getElementById('createRoomBtn').addEventListener('click', () => {
   closePeer();
   role = 'host';
+  updateFrameMeter();
   resetRound();
   const roomCodeInput = document.getElementById('roomCode');
   const copyButton = document.getElementById('copyRoomBtn');
@@ -647,6 +954,7 @@ document.getElementById('joinRoomBtn').addEventListener('click', () => {
   }
   closePeer();
   role = 'guest';
+  updateFrameMeter();
   resetRound();
   setConnectionStatus('部屋に接続しています…');
   try {
@@ -667,6 +975,7 @@ document.getElementById('joinRoomBtn').addEventListener('click', () => {
 document.getElementById('resetConnectionBtn').addEventListener('click', () => {
   closePeer();
   role = 'local';
+  updateFrameMeter();
   resetRound();
   document.getElementById('roomCode').value = '';
   document.getElementById('joinCodeInput').value = '';
@@ -680,13 +989,18 @@ document.getElementById('restart').addEventListener('click', () => {
       setConnectionStatus('通信が接続されていません');
       return;
     }
-    send({ type: 'rematch' });
+    send({ type: 'rematch', protocol: PROTOCOL_VERSION, epoch: syncEpoch });
     setConnectionStatus('ホストに再戦をリクエストしました');
     return;
   }
-  resetRound();
   if (role === 'host') {
-    send({ type: 'state', fighters, remaining, gameOver, rematch: true });
+    if (!channel?.open) {
+      setConnectionStatus('通信が接続されていません');
+      return;
+    }
+    startOnlineRound();
+  } else {
+    resetRound();
   }
 });
 
